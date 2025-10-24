@@ -6,6 +6,14 @@ import plotly.express as px
 from datetime import datetime, timedelta
 from prophet import Prophet
 import warnings
+import json
+import sqlite3
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+import smtplib
+from email.mime.text import MimeText
+from email.mime.multipart import MimeMultipart
+import hashlib
 warnings.filterwarnings('ignore')
 
 # Page configuration
@@ -39,6 +47,92 @@ st.markdown("""
 # Initialize session state
 if 'data_loaded' not in st.session_state:
     st.session_state.data_loaded = False
+if 'user_authenticated' not in st.session_state:
+    st.session_state.user_authenticated = False
+if 'alerts_enabled' not in st.session_state:
+    st.session_state.alerts_enabled = False
+if 'forecast_accuracy' not in st.session_state:
+    st.session_state.forecast_accuracy = {}
+
+# Database initialization
+def init_database():
+    """Initialize SQLite database for storing user data and settings"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    # Create tables
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE,
+            password_hash TEXT,
+            email TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY,
+            sku TEXT,
+            alert_type TEXT,
+            message TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            resolved BOOLEAN DEFAULT FALSE
+        )
+    ''')
+    
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS forecast_accuracy (
+            id INTEGER PRIMARY KEY,
+            sku TEXT,
+            forecast_date DATE,
+            predicted_value REAL,
+            actual_value REAL,
+            accuracy_score REAL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
+
+# Authentication functions
+def hash_password(password):
+    """Hash password for secure storage"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+def authenticate_user(username, password):
+    """Authenticate user credentials"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    password_hash = hash_password(password)
+    cursor.execute('SELECT id FROM users WHERE username = ? AND password_hash = ?', 
+                   (username, password_hash))
+    result = cursor.fetchone()
+    conn.close()
+    
+    return result is not None
+
+def create_user(username, password, email):
+    """Create new user account"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    password_hash = hash_password(password)
+    try:
+        cursor.execute('INSERT INTO users (username, password_hash, email) VALUES (?, ?, ?)',
+                       (username, password_hash, email))
+        conn.commit()
+        conn.close()
+        return True
+    except sqlite3.IntegrityError:
+        conn.close()
+        return False
+
+# Initialize database
+init_database()
 
 # Helper functions
 def generate_sample_data():
@@ -106,7 +200,7 @@ def generate_sample_data():
     
     return sales_df, products_df, inventory_df
 
-def forecast_demand(sales_df, sku, periods=30):
+def forecast_demand_prophet(sales_df, sku, periods=30):
     """Forecast demand using Prophet"""
     # Filter data for specific SKU
     sku_data = sales_df[sales_df['sku'] == sku].copy()
@@ -130,6 +224,147 @@ def forecast_demand(sales_df, sku, periods=30):
     forecast = model.predict(future)
     
     return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods)
+
+def forecast_demand_ml(sales_df, sku, periods=30):
+    """Advanced ML forecasting using Random Forest with feature engineering"""
+    # Filter data for specific SKU
+    sku_data = sales_df[sales_df['sku'] == sku].copy()
+    daily_sales = sku_data.groupby('date')['quantity_sold'].sum().reset_index()
+    
+    if len(daily_sales) < 30:
+        return forecast_demand_prophet(sales_df, sku, periods)
+    
+    # Feature engineering
+    daily_sales['day_of_week'] = daily_sales['date'].dt.dayofweek
+    daily_sales['month'] = daily_sales['date'].dt.month
+    daily_sales['day_of_month'] = daily_sales['date'].dt.day
+    daily_sales['is_weekend'] = (daily_sales['day_of_week'] >= 5).astype(int)
+    
+    # Create lag features
+    for lag in [1, 7, 14, 30]:
+        daily_sales[f'lag_{lag}'] = daily_sales['quantity_sold'].shift(lag)
+    
+    # Rolling averages
+    for window in [7, 14, 30]:
+        daily_sales[f'rolling_avg_{window}'] = daily_sales['quantity_sold'].rolling(window=window).mean()
+    
+    # Drop rows with NaN values
+    daily_sales = daily_sales.dropna()
+    
+    if len(daily_sales) < 20:
+        return forecast_demand_prophet(sales_df, sku, periods)
+    
+    # Prepare features and target
+    feature_cols = ['day_of_week', 'month', 'day_of_month', 'is_weekend'] + \
+                   [f'lag_{lag}' for lag in [1, 7, 14, 30]] + \
+                   [f'rolling_avg_{window}' for window in [7, 14, 30]]
+    
+    X = daily_sales[feature_cols]
+    y = daily_sales['quantity_sold']
+    
+    # Train model
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    
+    # Generate predictions
+    predictions = []
+    last_date = daily_sales['date'].max()
+    
+    for i in range(periods):
+        pred_date = last_date + timedelta(days=i+1)
+        
+        # Create features for prediction
+        pred_features = {
+            'day_of_week': pred_date.dayofweek,
+            'month': pred_date.month,
+            'day_of_month': pred_date.day,
+            'is_weekend': int(pred_date.dayofweek >= 5)
+        }
+        
+        # Use recent values for lag features
+        recent_sales = daily_sales['quantity_sold'].tail(30).values
+        for lag in [1, 7, 14, 30]:
+            if len(recent_sales) >= lag:
+                pred_features[f'lag_{lag}'] = recent_sales[-lag]
+            else:
+                pred_features[f'lag_{lag}'] = recent_sales[-1]
+        
+        # Rolling averages
+        for window in [7, 14, 30]:
+            if len(recent_sales) >= window:
+                pred_features[f'rolling_avg_{window}'] = np.mean(recent_sales[-window:])
+            else:
+                pred_features[f'rolling_avg_{window}'] = np.mean(recent_sales)
+        
+        # Make prediction
+        pred_X = pd.DataFrame([pred_features])
+        pred_y = model.predict(pred_X)[0]
+        predictions.append({
+            'ds': pred_date,
+            'yhat': max(0, pred_y),
+            'yhat_lower': max(0, pred_y * 0.8),
+            'yhat_upper': pred_y * 1.2
+        })
+    
+    return pd.DataFrame(predictions)
+
+def forecast_demand(sales_df, sku, periods=30, method='auto'):
+    """Main forecasting function with method selection"""
+    if method == 'prophet':
+        return forecast_demand_prophet(sales_df, sku, periods)
+    elif method == 'ml':
+        return forecast_demand_ml(sales_df, sku, periods)
+    else:  # auto
+        # Use ML for SKUs with sufficient data, Prophet otherwise
+        sku_data = sales_df[sales_df['sku'] == sku]
+        if len(sku_data) >= 90:  # 3 months of data
+            return forecast_demand_ml(sales_df, sku, periods)
+        else:
+            return forecast_demand_prophet(sales_df, sku, periods)
+
+def calculate_forecast_accuracy(sales_df, sku, days_back=30):
+    """Calculate historical forecast accuracy"""
+    try:
+        # Get historical data
+        sku_data = sales_df[sales_df['sku'] == sku].copy()
+        if len(sku_data) < days_back + 30:
+            return None
+        
+        # Split data
+        cutoff_date = sku_data['date'].max() - timedelta(days=days_back)
+        train_data = sku_data[sku_data['date'] <= cutoff_date]
+        test_data = sku_data[sku_data['date'] > cutoff_date]
+        
+        # Make forecast
+        forecast = forecast_demand_prophet(train_data, sku, days_back)
+        
+        # Compare with actual
+        test_actual = test_data.groupby('date')['quantity_sold'].sum()
+        forecast_dates = pd.to_datetime(forecast['ds'])
+        
+        actual_values = []
+        predicted_values = []
+        
+        for i, date in enumerate(forecast_dates):
+            if date in test_actual.index:
+                actual_values.append(test_actual[date])
+                predicted_values.append(forecast.iloc[i]['yhat'])
+        
+        if len(actual_values) > 0:
+            mae = mean_absolute_error(actual_values, predicted_values)
+            mse = mean_squared_error(actual_values, predicted_values)
+            mape = np.mean(np.abs((np.array(actual_values) - np.array(predicted_values)) / np.array(actual_values))) * 100
+            
+            return {
+                'mae': mae,
+                'mse': mse,
+                'mape': mape,
+                'accuracy': max(0, 100 - mape)
+            }
+    except:
+        pass
+    
+    return None
 
 def calculate_reorder_recommendations(sales_df, inventory_df, products_df):
     """Calculate which items need reordering"""
@@ -232,9 +467,206 @@ def identify_slow_movers(sales_df, inventory_df, days_threshold=90):
     
     return pd.DataFrame(slow_movers).sort_values('health_score')
 
+def create_alert(sku, alert_type, message):
+    """Create new alert in database"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO alerts (sku, alert_type, message) 
+        VALUES (?, ?, ?)
+    ''', (sku, alert_type, message))
+    
+    conn.commit()
+    conn.close()
+
+def get_active_alerts():
+    """Get all unresolved alerts"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        SELECT id, sku, alert_type, message, created_at 
+        FROM alerts 
+        WHERE resolved = FALSE 
+        ORDER BY created_at DESC
+    ''')
+    
+    alerts = cursor.fetchall()
+    conn.close()
+    
+    return pd.DataFrame(alerts, columns=['id', 'sku', 'alert_type', 'message', 'created_at'])
+
+def resolve_alert(alert_id):
+    """Mark alert as resolved"""
+    conn = sqlite3.connect('inventory_data.db')
+    cursor = conn.cursor()
+    
+    cursor.execute('UPDATE alerts SET resolved = TRUE WHERE id = ?', (alert_id,))
+    
+    conn.commit()
+    conn.close()
+
+def send_email_alert(to_email, subject, message):
+    """Send email notification (requires SMTP configuration)"""
+    try:
+        # This would need proper SMTP configuration
+        # For demo purposes, we'll just log the alert
+        st.info(f"📧 Email Alert: {subject} - {message}")
+        return True
+    except Exception as e:
+        st.error(f"Failed to send email: {e}")
+        return False
+
+def check_and_create_alerts(sales_df, inventory_df, reorder_df):
+    """Check conditions and create alerts"""
+    alerts_created = 0
+    
+    # Critical stock alerts
+    critical_items = reorder_df[reorder_df['status'] == 'critical']
+    for _, item in critical_items.iterrows():
+        message = f"CRITICAL: {item['product_name']} has only {item['days_of_stock']:.1f} days of stock remaining"
+        create_alert(item['sku'], 'critical_stock', message)
+        alerts_created += 1
+    
+    # Forecast accuracy alerts
+    for sku in sales_df['sku'].unique():
+        accuracy = calculate_forecast_accuracy(sales_df, sku)
+        if accuracy and accuracy['accuracy'] < 70:
+            message = f"Low forecast accuracy for {sku}: {accuracy['accuracy']:.1f}%"
+            create_alert(sku, 'low_accuracy', message)
+            alerts_created += 1
+    
+    return alerts_created
+
+def generate_abc_analysis(sales_df, inventory_df):
+    """Perform ABC analysis on inventory"""
+    # Calculate total revenue per SKU
+    sku_revenue = sales_df.groupby('sku')['revenue'].sum().reset_index()
+    sku_revenue = sku_revenue.sort_values('revenue', ascending=False)
+    
+    # Calculate cumulative percentage
+    sku_revenue['cumulative_revenue'] = sku_revenue['revenue'].cumsum()
+    total_revenue = sku_revenue['revenue'].sum()
+    sku_revenue['cumulative_pct'] = (sku_revenue['cumulative_revenue'] / total_revenue) * 100
+    
+    # Assign ABC categories
+    def assign_category(pct):
+        if pct <= 80:
+            return 'A'
+        elif pct <= 95:
+            return 'B'
+        else:
+            return 'C'
+    
+    sku_revenue['abc_category'] = sku_revenue['cumulative_pct'].apply(assign_category)
+    
+    return sku_revenue
+
+def calculate_safety_stock(sales_df, sku, service_level=0.95):
+    """Calculate optimal safety stock using statistical methods"""
+    sku_data = sales_df[sales_df['sku'] == sku]
+    daily_sales = sku_data.groupby('date')['quantity_sold'].sum()
+    
+    if len(daily_sales) < 30:
+        return 0
+    
+    # Calculate demand variability
+    mean_demand = daily_sales.mean()
+    std_demand = daily_sales.std()
+    
+    # Z-score for service level
+    from scipy.stats import norm
+    z_score = norm.ppf(service_level)
+    
+    # Safety stock calculation
+    safety_stock = z_score * std_demand * np.sqrt(7)  # Assuming 7-day lead time
+    
+    return max(0, int(safety_stock))
+
+def optimize_reorder_points(sales_df, inventory_df):
+    """Calculate optimized reorder points for all SKUs"""
+    optimized = []
+    
+    for _, inv_row in inventory_df.iterrows():
+        sku = inv_row['sku']
+        
+        # Calculate average demand during lead time
+        recent_sales = sales_df[
+            (sales_df['sku'] == sku) & 
+            (sales_df['date'] >= sales_df['date'].max() - timedelta(days=90))
+        ]
+        
+        avg_daily_demand = recent_sales['quantity_sold'].mean() if len(recent_sales) > 0 else 0
+        lead_time = inv_row['lead_time_days']
+        
+        # Calculate safety stock
+        safety_stock = calculate_safety_stock(sales_df, sku)
+        
+        # Optimal reorder point
+        reorder_point = (avg_daily_demand * lead_time) + safety_stock
+        
+        optimized.append({
+            'sku': sku,
+            'current_reorder_point': inv_row.get('reorder_point', 0),
+            'optimized_reorder_point': int(reorder_point),
+            'safety_stock': safety_stock,
+            'avg_daily_demand': avg_daily_demand
+        })
+    
+    return pd.DataFrame(optimized)
+
+# Authentication
+if not st.session_state.user_authenticated:
+    st.title("🔐 Login to AI Inventory System")
+    
+    tab1, tab2 = st.tabs(["Login", "Sign Up"])
+    
+    with tab1:
+        with st.form("login_form"):
+            username = st.text_input("Username")
+            password = st.text_input("Password", type="password")
+            login_button = st.form_submit_button("Login")
+            
+            if login_button:
+                if authenticate_user(username, password):
+                    st.session_state.user_authenticated = True
+                    st.session_state.username = username
+                    st.success("✅ Login successful!")
+                    st.rerun()
+                else:
+                    st.error("❌ Invalid credentials")
+    
+    with tab2:
+        with st.form("signup_form"):
+            new_username = st.text_input("Choose Username")
+            new_email = st.text_input("Email")
+            new_password = st.text_input("Choose Password", type="password")
+            confirm_password = st.text_input("Confirm Password", type="password")
+            signup_button = st.form_submit_button("Create Account")
+            
+            if signup_button:
+                if new_password != confirm_password:
+                    st.error("❌ Passwords don't match")
+                elif len(new_password) < 6:
+                    st.error("❌ Password must be at least 6 characters")
+                elif create_user(new_username, new_password, new_email):
+                    st.success("✅ Account created! Please login.")
+                else:
+                    st.error("❌ Username already exists")
+    
+    st.stop()
+
 # Sidebar
 with st.sidebar:
     st.title("📦 AI Inventory System")
+    st.markdown(f"**Welcome, {st.session_state.username}!**")
+    
+    if st.button("🚪 Logout"):
+        st.session_state.user_authenticated = False
+        st.session_state.username = None
+        st.rerun()
+    
     st.markdown("---")
     
     # Data loading section
@@ -270,9 +702,33 @@ with st.sidebar:
             st.success("✅ Sample data loaded!")
     
     st.markdown("---")
-    st.subheader("Settings")
+    st.subheader("⚙️ Settings")
     forecast_days = st.slider("Forecast Horizon (days)", 7, 90, 30)
     confidence_threshold = st.slider("Alert Confidence %", 70, 95, 85)
+    forecast_method = st.selectbox("Forecast Method", ["auto", "prophet", "ml"])
+    
+    st.markdown("---")
+    st.subheader("📧 Notifications")
+    email_alerts = st.checkbox("Enable Email Alerts")
+    if email_alerts:
+        alert_email = st.text_input("Alert Email", value="your@email.com")
+        st.session_state.alerts_enabled = True
+    
+    st.markdown("---")
+    st.subheader("📊 Quick Stats")
+    if st.session_state.data_loaded:
+        active_alerts = get_active_alerts()
+        st.metric("Active Alerts", len(active_alerts))
+        
+        # Show recent alerts
+        if len(active_alerts) > 0:
+            st.markdown("**Recent Alerts:**")
+            for _, alert in active_alerts.head(3).iterrows():
+                alert_emoji = "🔴" if alert['alert_type'] == 'critical_stock' else "⚠️"
+                st.write(f"{alert_emoji} {alert['message'][:50]}...")
+                if st.button(f"Resolve", key=f"resolve_{alert['id']}"):
+                    resolve_alert(alert['id'])
+                    st.rerun()
 
 # Main content
 if st.session_state.data_loaded:
@@ -285,7 +741,10 @@ if st.session_state.data_loaded:
     st.markdown(f"**Last Updated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | **Next Sync:** 58 minutes")
     
     # Tabs
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "📈 Forecasts", "🛒 Reorders", "📉 Slow Movers"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+        "📊 Overview", "📈 Forecasts", "🛒 Reorders", 
+        "📉 Slow Movers", "🎯 ABC Analysis", "🚨 Alerts"
+    ])
     
     with tab1:
         # Key Metrics
@@ -326,7 +785,7 @@ if st.session_state.data_loaded:
             
             # Get forecast
             try:
-                forecast = forecast_demand(sales_df, selected_sku, periods=7)
+                forecast = forecast_demand(sales_df, selected_sku, periods=7, method=forecast_method)
                 
                 fig = go.Figure()
                 
@@ -453,7 +912,7 @@ if st.session_state.data_loaded:
         
         with col2:
             try:
-                forecast_result = forecast_demand(sales_df, forecast_sku, periods=forecast_period)
+                forecast_result = forecast_demand(sales_df, forecast_sku, periods=forecast_period, method=forecast_method)
                 
                 st.markdown(f"**Forecast Summary for {forecast_sku}:**")
                 col_a, col_b, col_c = st.columns(3)
@@ -602,6 +1061,190 @@ if st.session_state.data_loaded:
                 st.info(f"**{row['product_name']}**: {row['recommended_action']} - {row['days_of_stock']} days of stock")
         else:
             st.success("✅ No slow-moving inventory detected! All items are moving well.")
+    
+    with tab5:
+        st.subheader("🎯 ABC Analysis & Optimization")
+        
+        # Generate ABC analysis
+        abc_analysis = generate_abc_analysis(sales_df, inventory_df)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("### ABC Category Distribution")
+            
+            category_counts = abc_analysis['abc_category'].value_counts()
+            
+            fig = px.pie(
+                values=category_counts.values,
+                names=category_counts.index,
+                title="SKU Distribution by ABC Category",
+                color_discrete_map={'A': '#10b981', 'B': '#f59e0b', 'C': '#ef4444'}
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Category insights
+            st.markdown("### 💡 Category Insights")
+            total_skus = len(abc_analysis)
+            a_items = len(abc_analysis[abc_analysis['abc_category'] == 'A'])
+            b_items = len(abc_analysis[abc_analysis['abc_category'] == 'B'])
+            c_items = len(abc_analysis[abc_analysis['abc_category'] == 'C'])
+            
+            st.info(f"""
+            **Category A** ({a_items} SKUs, {a_items/total_skus*100:.1f}%): High-value items requiring tight control
+            
+            **Category B** ({b_items} SKUs, {b_items/total_skus*100:.1f}%): Moderate control needed
+            
+            **Category C** ({c_items} SKUs, {c_items/total_skus*100:.1f}%): Low-value items, minimal control
+            """)
+        
+        with col2:
+            st.markdown("### Revenue Concentration")
+            
+            fig = go.Figure()
+            
+            fig.add_trace(go.Scatter(
+                x=list(range(1, len(abc_analysis) + 1)),
+                y=abc_analysis['cumulative_pct'],
+                mode='lines',
+                name='Cumulative Revenue %',
+                line=dict(color='#3b82f6', width=3)
+            ))
+            
+            # Add 80-20 line
+            fig.add_hline(y=80, line_dash="dash", line_color="red", 
+                         annotation_text="80% Revenue Line")
+            
+            fig.update_layout(
+                title="Pareto Analysis - Revenue Concentration",
+                xaxis_title="SKU Rank",
+                yaxis_title="Cumulative Revenue %",
+                height=400
+            )
+            
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # Optimization recommendations
+        st.subheader("🔧 Reorder Point Optimization")
+        
+        optimized_reorders = optimize_reorder_points(sales_df, inventory_df)
+        
+        # Show items with significant optimization potential
+        optimized_reorders['improvement'] = abs(
+            optimized_reorders['optimized_reorder_point'] - 
+            optimized_reorders['current_reorder_point']
+        )
+        
+        significant_changes = optimized_reorders[
+            optimized_reorders['improvement'] > 10
+        ].sort_values('improvement', ascending=False)
+        
+        if len(significant_changes) > 0:
+            st.markdown("**Items with Optimization Potential:**")
+            
+            for _, row in significant_changes.head(10).iterrows():
+                with st.expander(f"📦 {row['sku']} - Potential Improvement: {row['improvement']:.0f} units"):
+                    col1, col2, col3 = st.columns(3)
+                    
+                    with col1:
+                        st.metric("Current Reorder Point", f"{row['current_reorder_point']:.0f}")
+                    
+                    with col2:
+                        st.metric("Optimized Reorder Point", f"{row['optimized_reorder_point']:.0f}")
+                    
+                    with col3:
+                        st.metric("Safety Stock", f"{row['safety_stock']:.0f}")
+                    
+                    improvement_pct = (row['improvement'] / max(row['current_reorder_point'], 1)) * 100
+                    
+                    if row['optimized_reorder_point'] > row['current_reorder_point']:
+                        st.warning(f"⬆️ Increase reorder point by {row['improvement']:.0f} units ({improvement_pct:.1f}%) to reduce stockout risk")
+                    else:
+                        st.success(f"⬇️ Decrease reorder point by {row['improvement']:.0f} units ({improvement_pct:.1f}%) to free up cash")
+        else:
+            st.success("✅ All reorder points are already well-optimized!")
+    
+    with tab6:
+        st.subheader("🚨 Alert Management Center")
+        
+        # Create new alerts based on current data
+        if st.button("🔄 Refresh Alerts"):
+            with st.spinner("Checking for new alerts..."):
+                new_alerts = check_and_create_alerts(sales_df, inventory_df, reorder_df)
+                if new_alerts > 0:
+                    st.success(f"✅ Created {new_alerts} new alerts")
+                else:
+                    st.info("ℹ️ No new alerts needed")
+        
+        # Display active alerts
+        active_alerts = get_active_alerts()
+        
+        if len(active_alerts) > 0:
+            st.markdown(f"### 📋 Active Alerts ({len(active_alerts)})")
+            
+            # Filter alerts
+            alert_types = active_alerts['alert_type'].unique()
+            selected_types = st.multiselect("Filter by Type", alert_types, default=alert_types)
+            
+            filtered_alerts = active_alerts[active_alerts['alert_type'].isin(selected_types)]
+            
+            # Display alerts
+            for _, alert in filtered_alerts.iterrows():
+                alert_color = "🔴" if alert['alert_type'] == 'critical_stock' else "⚠️"
+                
+                with st.container():
+                    col1, col2, col3 = st.columns([6, 2, 2])
+                    
+                    with col1:
+                        st.write(f"{alert_color} **{alert['sku']}** - {alert['message']}")
+                        st.caption(f"Created: {alert['created_at']}")
+                    
+                    with col2:
+                        if st.button("✅ Resolve", key=f"resolve_main_{alert['id']}"):
+                            resolve_alert(alert['id'])
+                            st.rerun()
+                    
+                    with col3:
+                        if st.session_state.alerts_enabled:
+                            if st.button("📧 Send Email", key=f"email_{alert['id']}"):
+                                send_email_alert(
+                                    "manager@company.com",
+                                    f"Inventory Alert: {alert['sku']}",
+                                    alert['message']
+                                )
+                
+                st.markdown("---")
+        else:
+            st.success("🎉 No active alerts! Your inventory is in good shape.")
+        
+        # Alert statistics
+        st.markdown("### 📊 Alert Statistics")
+        
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            # Get all alerts from last 30 days
+            conn = sqlite3.connect('inventory_data.db')
+            cursor = conn.cursor()
+            cursor.execute('''
+                SELECT COUNT(*) FROM alerts 
+                WHERE created_at >= datetime('now', '-30 days')
+            ''')
+            alerts_30_days = cursor.fetchone()[0]
+            conn.close()
+            
+            st.metric("Alerts (30 days)", alerts_30_days)
+        
+        with col2:
+            critical_alerts = len(active_alerts[active_alerts['alert_type'] == 'critical_stock'])
+            st.metric("Critical Alerts", critical_alerts)
+        
+        with col3:
+            # Calculate average resolution time (mock data for demo)
+            st.metric("Avg Resolution Time", "2.3 hours")
 
 else:
     # Welcome screen
