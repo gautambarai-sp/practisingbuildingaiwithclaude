@@ -1,0 +1,16 @@
+date,sku,product_name,category,quantity_sold,revenue,price
+2024-01-01,TRD-BLK-M,Black Dress Medium,Dresses,12,959.88,79.99
+2024-01-01,JNS-BLU-32,Blue Jeans 32,Jeans,8,479.92,59.99
+2024-01-01,TSH-WHT-L,White T-Shirt Large,T-Shirts,15,374.85,24.99
+2024-01-01,JKT-LEA-M,Leather Jacket M,Jackets,3,599.97,199.99
+2024-01-01,SWT-GRN-XL,Green Sweater XL,Sweaters,5,249.95,49.99
+2024-01-02,TRD-BLK-M,Black Dress Medium,Dresses,10,799.90,79.99
+2024-01-02,JNS-BLU-32,Blue Jeans 32,Jeans,12,719.88,59.99
+2024-01-02,TSH-WHT-L,White T-Shirt Large,T-Shirts,18,449.82,24.99
+2024-01-02,PNT-BRN-36,Brown Pants 36,Pants,7,489.93,69.99
+2024-01-02,SCF-RED-OS,Red Scarf,Accessories,20,399.80,19.99
+2024-01-03,JKT-LEA-M,Leather Jacket M,Jackets,5,999.95,199.99
+2024-01-03,BLZ-GRY-L,Grey Blazer Large,Blazers,4,599.96,149.99
+2024-01-03,TRD-BLK-M,Black Dress Medium,Dresses,14,1119.86,79.99
+2024-01-03,JNS-BLU-32,Blue Jeans 32,Jeans,9,539.91,59.99
+2024-01-03,TSH-WHT-L,White T-Shirt Large,T-Shirts,22,549.78,24.99
