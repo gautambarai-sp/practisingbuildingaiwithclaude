@@ -4,7 +4,6 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
-from sklearn.linear_model import LinearRegression
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -107,7 +106,7 @@ def generate_sample_data():
     return sales_df, products_df, inventory_df
 
 def forecast_demand(sales_df, sku, periods=30):
-    """Forecast demand using Prophet"""
+    """Forecast demand using linear regression with seasonality"""
     # Filter data for specific SKU
     sku_data = sales_df[sales_df['sku'] == sku].copy()
     
@@ -115,21 +114,64 @@ def forecast_demand(sales_df, sku, periods=30):
     daily_sales = sku_data.groupby('date')['quantity_sold'].sum().reset_index()
     daily_sales.columns = ['ds', 'y']
     
-    # Train Prophet model
-    model = Prophet(
-        yearly_seasonality=True,
-        weekly_seasonality=True,
-        daily_seasonality=False,
-        seasonality_mode='multiplicative'
-    )
+    if len(daily_sales) < 7:
+        # Not enough data, use simple average
+        avg_sales = daily_sales['y'].mean() if len(daily_sales) > 0 else 10
+        future_dates = pd.date_range(
+            start=daily_sales['ds'].max() + timedelta(days=1) if len(daily_sales) > 0 else datetime.now(),
+            periods=periods,
+            freq='D'
+        )
+        forecast_df = pd.DataFrame({
+            'ds': future_dates,
+            'yhat': [avg_sales] * periods,
+            'yhat_lower': [max(0, avg_sales * 0.7)] * periods,
+            'yhat_upper': [avg_sales * 1.3] * periods
+        })
+        return forecast_df
     
-    model.fit(daily_sales)
+    # Prepare features for ML model
+    daily_sales['day_of_week'] = pd.to_datetime(daily_sales['ds']).dt.dayofweek
+    daily_sales['day_of_month'] = pd.to_datetime(daily_sales['ds']).dt.day
+    daily_sales['month'] = pd.to_datetime(daily_sales['ds']).dt.month
+    daily_sales['days_since_start'] = (pd.to_datetime(daily_sales['ds']) - pd.to_datetime(daily_sales['ds']).min()).dt.days
     
-    # Make future dataframe
-    future = model.make_future_dataframe(periods=periods)
-    forecast = model.predict(future)
+    # Features and target
+    X = daily_sales[['days_since_start', 'day_of_week', 'day_of_month', 'month']].values
+    y = daily_sales['y'].values
     
-    return forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail(periods)
+    # Train model
+    model = LinearRegression()
+    model.fit(X, y)
+    
+    # Generate future dates
+    last_date = pd.to_datetime(daily_sales['ds'].max())
+    future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
+    
+    # Prepare future features
+    start_days = (last_date - pd.to_datetime(daily_sales['ds']).min()).days + 1
+    future_features = pd.DataFrame({
+        'ds': future_dates,
+        'days_since_start': range(start_days, start_days + periods),
+        'day_of_week': [d.dayofweek for d in future_dates],
+        'day_of_month': [d.day for d in future_dates],
+        'month': [d.month for d in future_dates]
+    })
+    
+    X_future = future_features[['days_since_start', 'day_of_week', 'day_of_month', 'month']].values
+    predictions = model.predict(X_future)
+    
+    # Calculate confidence intervals (based on historical std)
+    std_dev = daily_sales['y'].std()
+    
+    forecast_df = pd.DataFrame({
+        'ds': future_dates,
+        'yhat': np.maximum(0, predictions),  # Ensure non-negative
+        'yhat_lower': np.maximum(0, predictions - 1.5 * std_dev),
+        'yhat_upper': predictions + 1.5 * std_dev
+    })
+    
+    return forecast_df
 
 def calculate_reorder_recommendations(sales_df, inventory_df, products_df):
     """Calculate which items need reordering"""
@@ -682,7 +724,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
-    <p>AI Inventory Optimization System v1.0 | Powered by Prophet ML & Streamlit</p>
+    <p>AI Inventory Optimization System v1.0 | Powered by Scikit-learn ML & Streamlit</p>
     <p style='font-size: 12px;'>For support: <a href='mailto:support@example.com'>support@example.com</a></p>
 </div>
 """, unsafe_allow_html=True)
