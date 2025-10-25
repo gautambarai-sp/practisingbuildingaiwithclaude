@@ -106,7 +106,7 @@ def generate_sample_data():
     return sales_df, products_df, inventory_df
 
 def forecast_demand(sales_df, sku, periods=30):
-    """Forecast demand using linear regression with seasonality"""
+    """Simple moving average forecast with trend adjustment"""
     # Filter data for specific SKU
     sku_data = sales_df[sales_df['sku'] == sku].copy()
     
@@ -130,47 +130,58 @@ def forecast_demand(sales_df, sku, periods=30):
         })
         return forecast_df
     
-    # Prepare features for ML model
-    daily_sales['day_of_week'] = pd.to_datetime(daily_sales['ds']).dt.dayofweek
-    daily_sales['day_of_month'] = pd.to_datetime(daily_sales['ds']).dt.day
-    daily_sales['month'] = pd.to_datetime(daily_sales['ds']).dt.month
-    daily_sales['days_since_start'] = (pd.to_datetime(daily_sales['ds']) - pd.to_datetime(daily_sales['ds']).min()).dt.days
+    # Calculate moving average (last 14 days)
+    window = min(14, len(daily_sales))
+    recent_avg = daily_sales['y'].tail(window).mean()
     
-    # Features and target
-    X = daily_sales[['days_since_start', 'day_of_week', 'day_of_month', 'month']].values
-    y = daily_sales['y'].values
+    # Calculate trend (simple linear trend over last 30 days)
+    recent_data = daily_sales.tail(min(30, len(daily_sales))).copy()
+    recent_data['index'] = range(len(recent_data))
     
-    # Train model
-    model = LinearRegression()
-    model.fit(X, y)
+    # Simple linear regression using numpy
+    x = recent_data['index'].values
+    y = recent_data['y'].values
+    
+    # Calculate slope (trend)
+    if len(x) > 1:
+        slope = np.polyfit(x, y, 1)[0]
+    else:
+        slope = 0
+    
+    # Day of week seasonality
+    daily_sales['dow'] = pd.to_datetime(daily_sales['ds']).dt.dayofweek
+    dow_avg = daily_sales.groupby('dow')['y'].mean()
+    overall_avg = daily_sales['y'].mean()
+    dow_factors = (dow_avg / overall_avg).to_dict() if overall_avg > 0 else {i: 1.0 for i in range(7)}
     
     # Generate future dates
     last_date = pd.to_datetime(daily_sales['ds'].max())
     future_dates = pd.date_range(start=last_date + timedelta(days=1), periods=periods, freq='D')
     
-    # Prepare future features
-    start_days = (last_date - pd.to_datetime(daily_sales['ds']).min()).days + 1
-    future_features = pd.DataFrame({
-        'ds': future_dates,
-        'days_since_start': range(start_days, start_days + periods),
-        'day_of_week': [d.dayofweek for d in future_dates],
-        'day_of_month': [d.day for d in future_dates],
-        'month': [d.month for d in future_dates]
-    })
-    
-    X_future = future_features[['days_since_start', 'day_of_week', 'day_of_month', 'month']].values
-    predictions = model.predict(X_future)
-    
-    # Calculate confidence intervals (based on historical std)
+    # Make predictions
+    predictions = []
     std_dev = daily_sales['y'].std()
     
-    forecast_df = pd.DataFrame({
-        'ds': future_dates,
-        'yhat': np.maximum(0, predictions),  # Ensure non-negative
-        'yhat_lower': np.maximum(0, predictions - 1.5 * std_dev),
-        'yhat_upper': predictions + 1.5 * std_dev
-    })
+    for i, date in enumerate(future_dates):
+        # Base prediction: recent average + trend
+        base_pred = recent_avg + (slope * (i + 1))
+        
+        # Apply day of week seasonality
+        dow = date.dayofweek
+        seasonal_factor = dow_factors.get(dow, 1.0)
+        pred = base_pred * seasonal_factor
+        
+        # Ensure non-negative
+        pred = max(0, pred)
+        
+        predictions.append({
+            'ds': date,
+            'yhat': pred,
+            'yhat_lower': max(0, pred - 1.5 * std_dev),
+            'yhat_upper': pred + 1.5 * std_dev
+        })
     
+    forecast_df = pd.DataFrame(predictions)
     return forecast_df
 
 def calculate_reorder_recommendations(sales_df, inventory_df, products_df):
@@ -271,6 +282,10 @@ def identify_slow_movers(sales_df, inventory_df, days_threshold=90):
                 'health_score': int(health_score),
                 'recommended_action': action
             })
+    
+    # Return empty DataFrame with correct columns if no slow movers
+    if len(slow_movers) == 0:
+        return pd.DataFrame(columns=['sku', 'product_name', 'current_stock', 'days_of_stock', 'health_score', 'recommended_action'])
     
     return pd.DataFrame(slow_movers).sort_values('health_score')
 
@@ -724,7 +739,7 @@ else:
 st.markdown("---")
 st.markdown("""
 <div style='text-align: center; color: #666; padding: 20px;'>
-    <p>AI Inventory Optimization System v1.0 | Powered by Scikit-learn ML & Streamlit</p>
+    <p>AI Inventory Optimization System v1.0 | Powered by Statistical Forecasting & Streamlit</p>
     <p style='font-size: 12px;'>For support: <a href='mailto:support@example.com'>support@example.com</a></p>
 </div>
 """, unsafe_allow_html=True)
